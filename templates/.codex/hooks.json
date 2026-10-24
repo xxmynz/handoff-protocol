@@ -1,0 +1,57 @@
+{
+  "description": "Agent protocol: inject the active dashboard at session start and enforce impact-tiered handoff continuity.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/protocol_context.py",
+            "commandWindows": "python scripts\\protocol_context.py",
+            "statusMessage": "Loading compact project handoff",
+            "timeout": 5,
+            "additionalContextLimit": 3500
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "bash|Bash|exec_command|shell|powershell|edit|Edit|write|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/protocol_guard.py",
+            "commandWindows": "python scripts\\protocol_guard.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "apply_patch|multiedit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/protocol_guard.py",
+            "commandWindows": "python scripts\\protocol_guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/protocol_guard.py",
+            "commandWindows": "python scripts\\protocol_guard.py",
+            "statusMessage": "Checking project handoff continuity",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

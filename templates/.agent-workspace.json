@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "name": "example-project",
+  "marker": ".agent-workspace-managed",
+  "dashboard": {
+    "file": "handoff-current.md",
+    "limitBytes": 5120,
+    "budgets": {
+      "AGENTS.md": 6144,
+      "AGENT-BOOTSTRAP.md": 3072
+    }
+  },
+  "handoffs": {
+    "active": "handoffs/active/",
+    "archive": "handoffs/archive/"
+  },
+  "memory": {
+    "index": "memory/INDEX.md"
+  },
+  "writePolicy": {
+    "material": {
+      "rootFiles": [
+        "agents.md",
+        "agent-bootstrap.md"
+      ],
+      "prefixes": [
+        "docs/",
+        "src/",
+        "scripts/",
+        "skills/",
+        "memory/"
+      ]
+    },
+    "ignored": {
+      "prefixes": [
+        "tmp/",
+        "temp/",
+        "build/",
+        "dist/",
+        "node_modules/",
+        ".cache/"
+      ],
+      "contains": [
+        "/raw/",
+        "/vendor/"
+      ]
+    },
+    "advisory": {
+      "prefixes": [
+        "scratch/"
+      ]
+    },
+    "ordinary": {
+      "rootFiles": [
+        "readme.md",
+        ".gitignore"
+      ],
+      "prefixes": []
+    }
+  },
+  "policy": []
+}
