@@ -63,7 +63,7 @@ def run() -> int:
               translate("D:\\投资工作站") == "D:\\投资工作站", translate("D:\\投资工作站"))
         check("windows: a forward-slash drive path stays as written",
               translate("D:/投资工作站") == "D:/投资工作站", translate("D:/投资工作站"))
-        unc = "\\\\wsl.localhost\\Ubuntu\\home\\yuan\\p"
+        unc = "\\\\wsl.localhost\\Ubuntu\\home\\example\\p"
         check("windows: an UNC path stays as written", translate(unc) == unc, translate(unc))
         check("windows: a relative path is untouched", translate("my-project") == "my-project",
               translate("my-project"))
@@ -74,7 +74,7 @@ def run() -> int:
         check("wsl: a forward-slash drive path becomes /mnt/<letter>",
               translate("D:/投资工作站") == "/mnt/d/投资工作站", translate("D:/投资工作站"))
         check("wsl: an UNC path becomes the real posix path",
-              translate(unc) == "/home/yuan/p", translate(unc))
+              translate(unc) == "/home/example/p", translate(unc))
         check("wsl: a relative path is untouched", translate("my-project") == "my-project",
               translate("my-project"))
 
@@ -87,8 +87,8 @@ def run() -> int:
         else:
             check("plain linux: a drive path is rejected with an explanation", False, "no error raised")
         check("plain linux: a posix absolute path is untouched",
-              translate("/home/yuan/projects/my-project") == "/home/yuan/projects/my-project",
-              translate("/home/yuan/projects/my-project"))
+              translate("/home/example/projects/my-project") == "/home/example/projects/my-project",
+              translate("/home/example/projects/my-project"))
 
     # 真入口跑一次：本机（WSL）里 `--target 'D:\invest-demo' --dry-run` 必须给出计划而不是报错。
     completed = subprocess.run(

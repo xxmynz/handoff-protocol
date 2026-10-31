@@ -23,12 +23,12 @@ stdin 一个 JSON 对象（你的工具给的名字可能不同，改名字的�
 | 字段 | 必需 | 用途 | 缺了会怎样 |
 |---|---|---|---|
 | `hook_event_name` | 是 | `SessionStart` / `PostToolUse` / `Stop` | 什么都不做 |
-| `session_id` | 是 | 运行时状态按会话隔离 | 所有会话共用 `unknown`，记账会串 |
+| `session_id` | 是 | 运行时状态按项目根目录与会话隔离 | 同项目缺失标识的会话共用 `unknown`，记账会串 |
 | `tool_name` | PostToolUse 必需 | 判工具类型：`edit`/`write` 这类原生文件工具，`bash`/`exec_command` 这类 shell | 该工具被忽略 |
 | `tool_input` | PostToolUse 必需 | 通知路径（`file_path` 等）或命令文本 | 有写入迹象时报 `unresolved local write`，保守要求交接 |
 | `tool_response` | PostToolUse 建议 | 判断这次调用是否失败/只读 | 无法判断，按成功处理 |
 | `cwd` | SessionStart 建议 | 分发器据此找项目根 | 退回进程当前目录和环境变量 |
-| `stop_hook_active` | Stop 可选 | 上次拦截后宿主是否已重跑 | 守卫自己数拦截次数，最多 3 次后降级为提醒 |
+| `stop_hook_active` | Stop 可选 | 宿主是否已在处理递归结束检查 | 为 `true` 时首次也不阻塞；缺失或为 `false` 时，守卫自行限制一次阻塞 |
 
 ## 输出
 
@@ -40,18 +40,29 @@ stdin 一个 JSON 对象（你的工具给的名字可能不同，改名字的�
 
 **PostToolUse** —— 不输出。宿主别因为 stdout 为空就报错。
 
-**Stop** —— 两种：
+**Stop** —— 可能阻塞、提醒或无输出。下面是不同调用的输出示例，不是一次输出两行：
 
 ```json
-{"decision": "block", "reason": "Handoff guard: ……"}
-{"systemMessage": "Handoff reminder only: ……"}
+{"decision": "block", "reason": "Handoff guard: …… Make at most one bounded handoff correction, then finish this turn. If still unresolved, report the gap in your final response. Do not keep rewriting handoffs or debug/modify the guard just to pass this check."}
+{"systemMessage": "Handoff guard: ……; automatic retries stopped; handoff is still unresolved; report the gap and finish this turn"}
 ```
 
-`block` 的意思是"这一轮不许结束，把 `reason` 给模型，让它再跑一轮补交接"。宿主不支持这个语义（只会把输出当日志），守卫就退化成"结束时提醒一次"。
+`block` 的意思是“把 `reason` 给模型，让它再做一次有界交接补正”。宿主不支持阻塞语义时，不能保证触发补正；只打印到日志不等于模型收到要求。普通或低影响修改也可能输出非阻塞的 `Handoff reminder only` 提醒。
+
+## 一次补救与状态保留
+
+v0.1.0 的 `STOP_BLOCK_LIMIT = 1`，额度按同一会话的**连续未解决区间**计算：
+
+1. 首次缺口最多阻塞一次，`reason` 要求只做一次有界补正；仍有缺口，就在最终答复报告并结束，不为过关调试守卫或反复重写交接。
+2. 后续最多输出一次警告，同时写 stderr；再后续 Stop 静默放行。`stop_hook_active: true` 表示递归检查，首次也不阻塞，直接走一次警告。
+3. 文件时间或大小变化、普通 `PostToolUse`、新的 material token 均不恢复额度。只有真正没有 issues 的 Stop 才重置，让同一会话后续新工作仍有一次机会。
+4. 放行不会清除 `material_pending`，不表示交接通过。新改动仍需正常交接或由负责人按最新 token 签收。
+
+终端 shell 交接须工具成功、目标明确且文本确实变化；原生文件工具沿用成功路径事件规则。常见直线内联 Python 可识别，`touch`、原样写回、打印路径、其他会话的更新和失败命令不能代替本会话交接。命令识别按 shell 命令位置解析；搜索或引号正文提到 `cp`、`tee`、`touch` 不当作写入。这是有限识别范围，不保证任意脚本无漏判。
 
 ## 最小接法
 
-把下面三行照抄进你自己的钩子配置即可。`<repo>` 指这个仓库放的位置，`<project>` 指你的项目。
+把下面两类调用接进你自己的钩子配置，并传递对应事件。`<repo>` 指这个仓库放的位置，`<project>` 指你的项目。
 
 ```sh
 # 会话开始
@@ -60,7 +71,7 @@ python3 <repo>/scripts/protocol_dispatch.py    # 读 stdin，注入 additionalCo
 python3 <repo>/scripts/protocol_dispatch.py
 ```
 
-不想用分发器、只在单个项目里接，就直接调项目自己那份副本：
+不想用分发器、只在单个项目里接，就在已接入项目根目录调项目自己那份副本。替换下面的占位路径；第二条只模拟一次已成功的重要文件写入事件，不实际写文件：
 
 ```sh
 echo '{"session_id":"t1","hook_event_name":"SessionStart","cwd":"<project>"}' \
@@ -70,13 +81,13 @@ echo '{"session_id":"t1","hook_event_name":"PostToolUse","tool_name":"write","to
   | python3 <project>/scripts/protocol_guard.py
 ```
 
-第二条命令静默退出 = 记账成功。第三条把 `hook_event_name` 换成 `Stop`，就该看到 `decision: block`。
+第二条命令预期静默退出；静默本身不证明记账成功。接着用相同 `session_id` 发送 `Stop` 事件；若目标路径被配置为重要文件、缺交接且该会话额度未用完，应看到 `decision: block`。
 
 ## 已知坑
 
-- **别在 Stop 里传死循环标记**。有些宿主把 `stop_hook_active` 写死成 `false`，守卫发现它不可信就自己数拦截次数（`STOP_BLOCK_LIMIT = 3`），超过上限只提醒、不再拦。所以不传这个字段是安全的。
+- **正确传递递归标记**。有些宿主把 `stop_hook_active` 固定为 `false`；守卫仍自行限制为一次阻塞，不靠文件变化重置。宿主真实处于递归 Stop 时应传 `true`，避免再触发阻塞。
 - **`tool_response` 被压成纯文本时**，守卫看不出来内容是不是正文：`Traceback` 字样只在 shell 工具里算失败，文件工具的正文里出现它不算。
-- **`systemMessage` 不一定被注入**。宿主不认这个字段时，守卫同时往 stderr 写一行，那是它在宿主日志里唯一能留下的证据。
+- **`systemMessage` 不一定被注入**。已知本地 DSH Stop 桥不注入它，所以关键补正与收尾要求必须保留在首次 `reason`；缺口警告另写 stderr 供宿主日志诊断，不能当作模型已收到提醒。
 - **子进程别拖**。分发器给每个脚本 8 秒，超时就当成没做事（`/tmp/protocol-dispatch.log` 里有记录）。
 
 ## 自测
@@ -86,4 +97,4 @@ python3 scripts/protocol_dispatch_selftest.py    # 分发器：找项目、跳�
 python3 scripts/protocol_guard_selftest.py       # 守卫：分级、拦截、确认放行
 ```
 
-两个都打印 `all checks passed` 再谈接线。接线之后最容易发现的症状是改完重要文件、会话却能直接结束——那说明 Stop 那条没接上，去宿主日志里看有没有 `skip:` 或 `failed:` 开头的行。
+两个都打印 `all checks passed` 再谈接线。接线后，在新会话里首次改完重要文件且未补交接，却完全没有阻塞或诊断提醒时，应检查 Stop 接线和宿主日志里的 `skip:`、`failed:`。已用完一次补救额度或传入递归标记时允许结束是预期行为，不能仅凭“能结束”判断接线失效。

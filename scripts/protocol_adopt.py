@@ -308,7 +308,7 @@ def print_plan(target: Path, name: str, plan: dict[str, list[str]], adopted: boo
         for item in sorted(plan[KEEP_FILES]):
             print(f"    = {item}")
     print("-" * 68)
-    print("  安全保证：已存在的文件绝不覆盖；只有上面带 + 的项目会被写。")
+    print("  写入范围：只执行上面列明的新建、更新与旧键清理；同名协议脚本会覆盖，已有交接正文不动。")
 
 
 def check_sync(targets: list[Path], source: Path) -> dict[str, Any]:
@@ -360,21 +360,22 @@ def print_sync_report(report: dict[str, Any]) -> None:
             print(f"\n  {entry['target']}")
             print("    - 还没接入协议（没有配置文件），跳过")
             continue
-        state = "一致" if entry["ok"] else "落后/缺失"
+        state = "一致" if entry["ok"] else "有差异/缺失"
         print(f"\n  {entry['target']}  [{state}]")
         print(f"    一致 {len(entry['identical'])} 项")
         for script in entry["drift"]:
-            print(f"    ! 落后模板: scripts/{script}")
+            print(f"    ! 与模板不同: scripts/{script}")
         for script in entry["missing"]:
             print(f"    ! 缺少: scripts/{script}")
         if not entry["ok"]:
             adopt_script = Path(report["source"]) / "protocol_adopt.py"
-            print(f"    → 修复: python3 {adopt_script} --target {entry['target']}")
+            print("    → 先核对是否有项目定制；仅在确认可覆盖后同步：")
+            print(f"      python3 {adopt_script} --target {entry['target']} --dry-run")
     print("-" * 68)
     if report["in_sync"]:
         print("结果：所有已接入项目都与模板一致。")
     else:
-        print("结果：有项目落后于模板（上面的 ! 行）；跑上面给出的 adopt 命令即可同步。")
+        print("结果：有项目与模板不同或缺文件；差异不等于落后，定制项目应审阅合并，不要直接覆盖。")
 
 
 def next_steps(target: Path) -> None:
@@ -448,7 +449,7 @@ def main() -> int:
         print("找不到模板骨架 / template skeleton not found:", file=sys.stderr)
         print(f"  已尝试位置: {templates}", file=sys.stderr)
         print("  请在模板仓库里运行，或显式指定：", file=sys.stderr)
-        print("    python3 ~/projects/agent-protocol-template/scripts/protocol_adopt.py \\", file=sys.stderr)
+        print(f"    python3 {HERE / 'protocol_adopt.py'} \\", file=sys.stderr)
         print(f"      --target {target}", file=sys.stderr)
         print("  （也可以用环境变量 AGENT_PROTOCOL_TEMPLATE 指向模板仓库）", file=sys.stderr)
         return 2

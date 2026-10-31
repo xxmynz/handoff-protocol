@@ -11,7 +11,7 @@ PROTOCOL_HOME="$PWD"
 DEMO="$(mktemp -d)"
 python3 "$PROTOCOL_HOME/scripts/protocol_adopt.py" --target "$DEMO/my-project" --dry-run
 python3 "$PROTOCOL_HOME/scripts/protocol_adopt.py" --target "$DEMO/my-project" --yes
-python3 "$DEMO/my-project/scripts/protocol_validate.py"
+(cd "$DEMO/my-project" && python3 scripts/protocol_validate.py)
 ```
 
 预期最后出现 `VALIDATION PASSED`。这是骨架检查，不代表示例内容已经符合你的真实项目，也不表示任何自动事件已经启用。
@@ -23,7 +23,7 @@ python3 "$DEMO/my-project/scripts/protocol_validate.py"
 ```sh
 python3 scripts/protocol_adopt.py --target "/path/to/my-project" --dry-run
 python3 scripts/protocol_adopt.py --target "/path/to/my-project" --yes
-python3 "/path/to/my-project/scripts/protocol_validate.py"
+(cd "/path/to/my-project" && python3 scripts/protocol_validate.py)
 ```
 
 计划中需重点看：
@@ -109,7 +109,7 @@ python3 scripts/protocol_handoff_confirm.py \
 
 ## 更新协议脚本
 
-模板目录和各项目里的脚本是**独立副本**。修改这套工具，不会自动把其他项目都升级。
+v0.1.0（2026-10-31）的变化见[更新记录](<../CHANGELOG.md>)。模板目录和各项目里的脚本是**独立副本**；修改模板或推送 GitHub，都不会自动把其他项目升级。
 
 接入脚本的同步清单为：[protocol.py](<../scripts/protocol.py>)、[protocol_guard.py](<../scripts/protocol_guard.py>)、[protocol_handoff_confirm.py](<../scripts/protocol_handoff_confirm.py>)、[protocol_context.py](<../scripts/protocol_context.py>)、[protocol_validate.py](<../scripts/protocol_validate.py>)、[protocol_mcp_server.py](<../scripts/protocol_mcp_server.py>)、[protocol_adopt.py](<../scripts/protocol_adopt.py>)。全局事件分发器和自测脚本留在完整工具目录，不随项目接入同步；需要另行维护。
 
@@ -119,9 +119,19 @@ python3 scripts/protocol_handoff_confirm.py \
 python3 scripts/protocol_adopt.py --check-sync --sync-targets /path/to/my-project
 ```
 
+`--check-sync` 只报告字节是否相同，不更新文件。输出“有差异/缺失”时先核对项目定制；差异不一定表示版本落后。
+
 如果省略 `--sync-targets`，当前实现会检查当前目录和 `~/projects/` 下的直接子目录，不会只检查眼前一个项目。为了范围清楚，建议显式指定；多个路径用逗号分隔。
 
-需要更新时，先比较项目定制内容、保留差异，再对目标运行 `--dry-run` 和实际接入。尤其不要把已有项目的特殊守卫版本整套覆盖。更新了 MCP 服务脚本后，还需要重启对应的 MCP 进程；磁盘上的新代码不会自动进入已运行的进程。
+需要更新时，先备份并比较项目定制内容，尤其是守卫、状态目录和交接签收逻辑；有定制时不能盲目运行接入脚本。从新版本工具根目录预览，确认后才同步七个同名运行时脚本：
+
+```sh
+python3 scripts/protocol_adopt.py --target "/path/to/my-project" --dry-run
+python3 scripts/protocol_adopt.py --target "/path/to/my-project" --yes
+(cd "/path/to/my-project" && python3 scripts/protocol_validate.py)
+```
+
+接入会覆盖清单内有差异的脚本，也可能删除明确废弃的顶层 `mcp` 键；会保留项目 `writePolicy`、已有治理文档、交接、长期记录和原始成果，不用模板正文覆盖它们。新版本守卫状态按项目根目录隔离，即使项目名称相同也不共用状态；升级后应新开会话验证，不能把旧临时状态当作本版已完成交接的证明。更新了 MCP 服务脚本后，还需要择机重启对应的 MCP 进程；磁盘上的新代码不会自动进入已运行的进程。
 
 ## 停用而不丢掉记录
 
@@ -135,6 +145,6 @@ python3 scripts/protocol_adopt.py --check-sync --sync-targets /path/to/my-projec
 ## 常见疑问
 
 - **校验通过了，为什么没有自动提醒？** 项目文件与事件接线是两件事。请看 [DSH 接入边界](<dsh-integration.md>)；只注册 MCP 也不会自动在结束前拦截。
-- **一直提示没写交接？** 检查最新重要成果修改之后是否真的更新了两份交接、工具是否成功、事件是否带完整目标参数。终端 Python 识别也有边界，不承诺识别任意动态脚本。优先用原生文件编辑工具明确更新，不靠 `touch` 或重复无变化命令应付。
+- **提示没写交接后怎么收尾？** v0.1.0 在同一连续缺口内最多拦一次、随后提醒一次，再静默放行；改文件或继续调用工具不恢复额度，真正无缺口的结束检查才重置。首次只做一次有界补正：检查最新成果后是否更新了两份交接、工具是否成功、目标参数是否完整；仍有缺口就报告并结束，不继续调试守卫或反复重写。放行不表示待交接状态已清除。终端 Python 识别有边界；优先用原生文件编辑工具，不靠 `touch`、原样写回或重复无变化命令应付。
 - **为什么不自动保存一切？** 这是精选交接，不是全量聊天备份。长期知识只在用户明确要求时维护。
 - **换另一个 AI 工具能用吗？** 文本模板可以迁移，事件接线需要单独适配与实测。能读取文件不等于具有自动阻塞能力。

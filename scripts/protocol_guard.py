@@ -31,14 +31,30 @@ import protocol  # noqa: E402  (local sibling module)
 
 DASHBOARD_LIMIT_FALLBACK = 5 * 1024
 
-WRITE_COMMAND_RE = re.compile(
-    r"\b(?:Set-Content|Out-File|Add-Content|Copy-Item|Move-Item|New-Item|"
-    r"Remove-Item|git\s+apply|sed\s+-i|cp\s|mv\s|touch\s|tee\s)"
-    # shell 重定向也是写入：> file / >> file（排除 2>&1、>=、-> 一类）。
-    # A shell redirect writes a file too; `2>&1`, `>=` and `->` are not writes.
-    r"|(?<![0-9\w])>>?\s*(?!&|=)\S",
-    re.IGNORECASE,
-)
+# 只有出现在**命令位置**的动词才是写入；正文里提到的 `cp ` 只是文字。
+# 旧版对整个命令行做正则搜索，于是 `grep -n "cp " scripts/x.py` 这种只读命令
+# 会被判成改了 `scripts/x.py`，交接怎么更新都清不掉，回合永远收不了尾。
+# Only a command-position verb writes; a word merely mentioned is not a command.
+SHELL_WRITE_COMMANDS = frozenset({
+    "set-content", "out-file", "add-content", "copy-item", "move-item",
+    "new-item", "remove-item", "cp", "mv", "touch", "tee",
+    "rm", "rmdir", "mkdir", "dd", "truncate", "install", "rsync", "patch",
+})
+# 这些词先占住命令位置，真正的命令在它们后面 / these run the real command.
+SHELL_WRAPPER = frozenset({
+    "sudo", "env", "command", "exec", "nohup", "time", "nice", "ionice",
+    "timeout", "stdbuf", "xargs",
+})
+# find 用 -exec 重新进入命令位置 / find re-enters command position after -exec.
+SHELL_REEXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# 嵌套 shell 的 -c 里还是命令 / a nested shell's -c carries more commands.
+SHELL_NESTED = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+SHELL_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
+# 重定向也是写入：> file / >> file / 2> file（排除 2>&1、>=、-> 一类）。
+# A redirect writes too; `2>&1`, `>=` and `->` are not writes.
+REDIRECT_RE = re.compile(r"^\d*>>?(?!&|=)")
+# 写进黑洞不算改了文件 / writing into a bit bucket is not a change.
+SHELL_SINKS = frozenset({"/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "nul", "nul:", "$null"})
 
 # DSH / Claude Code 系原生文件工具：参数里直接带 file_path，不从命令行解析。
 # Native DSH / Claude Code file tools: the path arrives as an argument.
@@ -48,9 +64,9 @@ SHELL_TOOLS = {"bash", "exec_command", "shell", "powershell"}
 # 只信任响应开头的错误措辞 / only the response's opening words may name a failure.
 ERROR_HEAD_RE = re.compile(r"^\W{0,3}(?:error|failed|failure|exception)\b")
 # 桥把 Stop 的 stop_hook_active 固定为 false（DSH 0.2.0-rc.2），该防死循环标记失效；
-# 同一个会话连续拦截超过上限后降级为提醒，绝不让 Stop 永久卡住宿主。
+# 同一会话的连续未解决区间最多拦一次；改文件不恢复额度，无缺口的 Stop 才重置。
 # The bridge hardcodes stop_hook_active:false, so the guard counts its own blocks.
-STOP_BLOCK_LIMIT = 3
+STOP_BLOCK_LIMIT = 1
 
 
 def temp_root(name: str, root: Path | None = None) -> Path:
@@ -153,20 +169,246 @@ SHELL_WRITE_VERBS = frozenset({
 })
 
 
+# 命令词不是路径；候选按空白切分前先剥离它们 / command words are not paths.
+# 引号内的空格属于路径本身，所以先按引号感知的方式切成词 / quotes protect spaces.
+SHELL_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+
+
+def _is_separator(token: str) -> bool:
+    return bool(token) and all(character in "();|&" for character in token)
+
+
+def _logical_lines(text: str) -> list[str]:
+    """按换行切成逻辑行，但引号内的换行不算 / newlines outside quotes only.
+
+    `python3 -c "` 后面跨好几行的内联脚本是常见写法；按物理行切会把引号切开，
+    分词失败后退化成「保守认定有写入」，于是只读命令又开始误报。
+    """
+    lines: list[str] = []
+    current: list[str] = []
+    quote = ""
+    for character in text:
+        if quote:
+            if character == quote:
+                quote = ""
+        elif character in "\"'":
+            quote = character
+        elif character == "\n":
+            lines.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+    lines.append("".join(current))
+    return lines
+
+
+def shell_tokens(text: str) -> list[list[str]] | None:
+    """把命令行切成若干条简单命令的词表 / one token list per simple command.
+
+    shlex 的标点模式会把引号里的内容保持成**一个词**，于是 `grep -n "cp " f.py`
+    里的 `cp ` 再也不会被当成命令。返回 None 表示引号不配对等无法分词的情况，
+    调用方按「保守认定有写入」处理，绝不因为解析失败就放行。
+    """
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for line in _logical_lines(strip_heredocs(text)):
+        lexer = shlex.shlex(line, posix=True, punctuation_chars="();<>|&")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        lexer.escape = ""  # 反斜杠是 Windows 路径的一部分，不是转义符
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            return None
+        for token in tokens:
+            if _is_separator(token):
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(token)
+        if current:  # 换行也是命令分隔符
+            segments.append(current)
+            current = []
+    return segments
+
+
+def _path_args(tokens: list[str]) -> list[str]:
+    """选项与命令词不是路径；只留看起来像路径的词 / only path-looking words."""
+    return [token for token in tokens
+            if not token.startswith("-") and token.lower() not in SHELL_WRITE_VERBS
+            and ("/" in token or "\\" in token)]
+
+
+# 这些命令只写最后那个参数（源文件不动）/ only the last argument is written.
+SHELL_LAST_TARGET = frozenset({"cp"})
+# 这些命令的每个参数都算改动（`mv` 会把源文件删掉）/ every argument changes.
+SHELL_ALL_TARGETS = frozenset({"mv", "ln", "tee", "touch", "rm", "rmdir", "mkdir", "truncate"})
+
+
+def _write_targets(command: str, rest: list[str]) -> list[str]:
+    """按命令语义找出写入目标，包括不含 `/` 的裸文件名 / bare names count too.
+
+    交接文件常常就在项目根（`handoff-current.md`、`README.md`），名字里没有斜杠；
+    只收「像路径」的词会把它们全漏掉，于是更新了 dashboard 也不算数。
+    """
+    args = [token for token in rest
+            if not token.startswith("-") and not REDIRECT_RE.match(token)
+            and token.lower() not in SHELL_SINKS]
+    if not args:
+        return []
+    if command in SHELL_LAST_TARGET:
+        return args[-1:]
+    if command in SHELL_ALL_TARGETS:
+        return args
+    if command == "sed":
+        # 第一个非选项参数是 sed 脚本（如 `s/a/b/`），后面的才是目标文件。
+        return args[1:]
+    return []
+
+
+def _command_head(tokens: list[str]) -> int:
+    """跳过变量赋值、sudo/env/xargs 一类前缀，返回真正命令的下标。"""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if SHELL_ASSIGN_RE.match(token) or token.lower() in SHELL_WRAPPER:
+            index += 1
+            while index < len(tokens) and (tokens[index].startswith("-") or re.fullmatch(r"\d+[smhd]?", tokens[index])):
+                index += 1
+            continue
+        return index
+    return len(tokens)
+
+
+def _segment_writes(segment: list[str]) -> tuple[bool, list[str]]:
+    """一条简单命令是否写入、写到哪 / does this simple command write, and where."""
+    writes = False
+    paths: list[str] = []
+    for index, token in enumerate(segment):
+        if REDIRECT_RE.match(token):
+            if index + 1 < len(segment):
+                target = segment[index + 1]
+                # 丢弃到 /dev/null、NUL 之类的黑洞不是改了项目文件。
+                if target.lower() not in SHELL_SINKS:
+                    writes = True
+                    paths.append(target)
+    head = _command_head(segment)
+    if head >= len(segment):
+        return writes, paths
+    command = segment[head].lower()
+    rest = segment[head + 1:]
+    if command == "dd":
+        # dd 的目标写在 of= 里 / dd names its target with of=.
+        targets = [token[3:] for token in rest if token.startswith("of=") and len(token) > 3]
+        targets = [item for item in targets if item.lower() not in SHELL_SINKS]
+        writes = writes or bool(targets)
+        paths.extend(targets)
+    elif command in SHELL_WRITE_COMMANDS:
+        if command in SHELL_LAST_TARGET or command in SHELL_ALL_TARGETS:
+            # 认得语义就只信语义，不再退回「像路径的词」，否则 `tee /dev/null` 又会被收进来。
+            targets = _write_targets(command, rest)
+        else:
+            # cat/echo/printf 之类只有配重定向才写，目标已由重定向分支收走。
+            targets = _path_args(rest)
+        # 全部目标都是黑洞时，这条命令没有改任何项目文件。
+        if targets or command not in SHELL_LAST_TARGET | SHELL_ALL_TARGETS:
+            writes = True
+        paths.extend(targets)
+    elif command == "sed" and any(token.startswith(("-i", "--in-place")) for token in rest):
+        writes = True
+        paths.extend(_write_targets("sed", rest))
+    elif command == "git" and "apply" in [token.lower() for token in rest]:
+        writes = True
+        paths.extend(_path_args(rest))
+    elif command in SHELL_NESTED and "-c" in rest:
+        inner = rest[rest.index("-c") + 1:]
+        nested = _shell_writes(inner[0]) if inner else None
+        if nested is not None:
+            writes = writes or nested[0]
+            paths.extend(nested[1])
+    elif command == "find":
+        # find 的 -exec/-ok 后面又是一条命令 / find re-enters command position.
+        for index, token in enumerate(rest):
+            if token.lower() in SHELL_REEXEC and index + 1 < len(rest):
+                nested = _shell_writes(" ".join(rest[index + 1:]))
+                if nested is not None:
+                    writes = writes or nested[0]
+                    paths.extend(nested[1])
+                break
+    return writes, paths
+
+
+def _shell_writes(text: str) -> tuple[bool, list[str]] | None:
+    segments = shell_tokens(text)
+    if segments is None:
+        return None
+    writes = False
+    paths: list[str] = []
+    for segment in segments:
+        found, targets = _segment_writes(segment)
+        writes = writes or found
+        paths.extend(targets)
+    return writes, paths
+
+
+def shell_is_write(text: str) -> bool:
+    """命令位置上的写入动词或重定向才算写入；分词失败时保守认定是写入。"""
+    result = _shell_writes(text)
+    return True if result is None else result[0]
+
+
 def shell_paths(text: str) -> list[str]:
-    """从明显写入命令中收集保守的路径线索 / conservative path hints."""
-    candidates = re.findall(
-        r"(?:[A-Za-z]:[\\/][^\s\"']+|(?:\.{0,2}[\\/])?[\w. -]+[\\/][\w./\\ -]+)",
-        text,
-    )
-    paths = []
-    for item in candidates:
-        item = item.strip()
-        head, sep, tail = item.partition(" ")
-        if sep and head.lower() in SHELL_WRITE_VERBS and ("/" in tail or "\\" in tail):
-            item = tail.strip()
-        paths.append(item)
-    return paths
+    """收集保守的路径线索 / conservative path hints.
+
+    `cp a.md papers/x.md` 曾被整条命中成一条「路径」、目标反而漏判；按空白硬拆
+    又会把 `"papers/Chapter 2 draft.md"` 拆碎。现在按引号感知分词后再筛。
+    """
+    segments = shell_tokens(text)
+    if segments is None:  # 分词失败时退回旧的正则切词
+        return [word.strip("\"'") for word in SHELL_TOKEN_RE.findall(text)
+                if not word.strip("\"'").startswith("-")
+                and word.strip("\"'").lower() not in SHELL_WRITE_VERBS
+                and ("/" in word or "\\" in word)]
+    return _path_args([token for segment in segments for token in segment])
+
+
+HEREDOC_OPEN_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
+
+
+def strip_heredocs(text: str) -> str:
+    """删掉 heredoc 正文，只留下真正会被 shell 执行的命令行。
+
+    heredoc 正文里写着的 `cp a.md papers/b.md` 只是文字，不是命令；整段搜索会把
+    它当成真的写入，于是「用 heredoc 写一段说明」就足以让守卫认定成果文件被改动。
+    A heredoc body is data, not commands: only the opening line may write.
+    """
+    lines = text.splitlines()
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for match in HEREDOC_OPEN_RE.finditer(line):
+            terminator = match.group(2)
+            while index < len(lines) and lines[index].strip() != terminator:
+                index += 1
+            index += 1  # 连同结束行一起跳过
+    return "\n".join(kept)
+
+
+def shell_write_paths(text: str) -> list[str]:
+    """只在实际执行写入的那条简单命令里找目标路径。
+
+    整段命令行搜索会把 heredoc 正文里**只是被提到**的路径当成被写入的文件：
+    一条 `cp a.md /tmp/` 加一段提到 `literature/...` 的 python heredoc，就足以让
+    守卫认定成果文件被改动，之后无论怎么更新交接都清不掉。
+    Only the simple command that actually writes may contribute target paths;
+    a path merely mentioned inside a heredoc body is not a write.
+    """
+    result = _shell_writes(text)
+    return shell_paths(text) if result is None else result[1]
 
 
 def _unique(values: list[str]) -> list[str]:
@@ -190,9 +432,18 @@ def classify_write(proto: protocol.Protocol, payload: dict[str, Any]) -> dict[st
             result["ordinary"].append("unresolved file-tool write")
             return result
     elif tool_name.lower() in SHELL_TOOLS:
-        if not WRITE_COMMAND_RE.search(text):
-            return result
-        paths = shell_paths(text)
+        # 内联 Python 先按语法读目标；读不出来再退回命令位置判定。
+        # `python3 - <<'PY' … p.write_text(…)` 是最常见的改文件写法，只按 shell
+        # 命令看会漏掉整个写入，于是改完文件却不算数，回合永远收不了尾。
+        python_paths = python_write_paths(text)
+        if python_paths:
+            paths = python_paths
+        else:
+            # 只看真正会被执行的部分：heredoc 正文是数据，不是命令。
+            executed = strip_heredocs(text)
+            if not shell_is_write(executed):
+                return result
+            paths = shell_write_paths(executed)
         if not paths:
             result["ordinary"].append("unresolved local write")
             return result
@@ -259,10 +510,15 @@ def python_write_paths(text: str) -> list[str] | None:
             left, right = value(node.left), value(node.right)
             return str(Path(left) / right) if left is not None and right is not None else None
         if isinstance(node, ast.Call):
+            # `Path(...)` 与 `pathlib.Path(...)` 是同一个东西；漏了后者会让
+            # 「先 pathlib.Path(...) 再 write_text」这种最平常的写法查不到目标。
             if isinstance(node.func, ast.Name) and node.func.id in ("Path", "open") and node.args:
                 return value(node.args[0])
-            if isinstance(node.func, ast.Attribute) and node.func.attr in ("resolve", "absolute"):
-                return value(node.func.value)
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("resolve", "absolute", "expanduser"):
+                    return value(node.func.value)
+                if node.func.attr in ("Path", "path") and node.args:
+                    return value(node.args[0])
         return None
 
     straight = (ast.Assign, ast.AnnAssign, ast.Expr, ast.With)
@@ -283,7 +539,12 @@ def python_write_paths(text: str) -> list[str] | None:
     # 仅识别直线执行语句/with；不猜函数、分支、循环或任意脚本的运行结果。
     for statement in tree.body:
         if not isinstance(statement, straight):
-            if not isinstance(statement, (ast.Import, ast.ImportFrom)):
+            # def/class 只绑定自己的名字，assert/pass 既不写文件也不重新绑定任何名字；
+            # 把它们当成未解释控制流清空变量，会让「先定路径、再定义 helper 或断言、
+            # 最后写文件」这种常见写法漏判——真实触发是用 heredoc 改 handoff-current.md。
+            if not isinstance(statement, (ast.Import, ast.ImportFrom, ast.FunctionDef,
+                                          ast.AsyncFunctionDef, ast.ClassDef,
+                                          ast.Assert, ast.Pass)):
                 variables.clear()  # 未解释的控制流可能重新绑定先前的路径变量。
             continue
         if isinstance(statement, ast.With) and any(isinstance(node, ast.stmt) and not isinstance(node, straight) for node in ast.walk(statement)):
@@ -329,11 +590,13 @@ def observed_shell_handoffs(proto: protocol.Protocol, payload: dict[str, Any], s
     if python_paths is not None:
         targets = {proto.normalise(item) for item in python_paths}
     else:
-        if not WRITE_COMMAND_RE.search(text):
+        # 同样的命令位置判定：只在真正执行的简单命令里认路径。
+        executed = strip_heredocs(text)
+        if not shell_is_write(executed):
             return []
         try:
             # 明显 shell 写入仍受实际内容差异约束；兼容裸 dashboard 文件名。
-            targets = {proto.normalise(item) for item in [*shell_paths(text), *shlex.split(text)]}
+            targets = {proto.normalise(item) for item in [*shell_paths(executed), *shlex.split(executed)]}
         except ValueError:
             return []
     return [relative for relative, content in current.items()
@@ -426,25 +689,6 @@ def dashboard_issues(proto: protocol.Protocol) -> list[str]:
     return issues
 
 
-def stop_key(proto: protocol.Protocol, state: dict[str, Any], issues: list[str]) -> str:
-    """只用于重复通知去重，不作为交接通过证据。"""
-    files = {proto.path(proto.dashboard), *proto.path(proto.handoff_active).glob("*.md")}
-    for relative in state.get("material_paths", []):
-        item = proto.path(relative).resolve()
-        if item.is_relative_to(proto.root.resolve()):
-            files.add(item)
-    stamps = []
-    for item in sorted(files):
-        try:
-            info = item.stat()
-            stamps.append((str(item), info.st_mtime_ns, info.st_size))
-        except OSError:
-            stamps.append((str(item), None, None))
-    # ponytail: 元数据相同的内容替换可能不被识别；去重不授权通过，需要时改为限定文件内容摘要。
-    return json.dumps([issues, state.get("material_pending"), state.get("dashboard_updated"),
-                       state.get("detail_updated"), stamps], ensure_ascii=False)
-
-
 def handle_stop(proto: protocol.Protocol, path: Path, payload: dict[str, Any]) -> None:
     state = load_state(path)
     issues = dashboard_issues(proto)
@@ -461,18 +705,18 @@ def handle_stop(proto: protocol.Protocol, path: Path, payload: dict[str, Any]) -
         )
 
     if issues:
-        key = stop_key(proto, state, issues)
         blocks = int(state.get("stop_blocks", 0))
-        retry = (payload.get("stop_hook_active") is not True
-                 and state.get("stop_seen") != key and blocks < STOP_BLOCK_LIMIT)
-        state["stop_seen"] = key
+        retry = payload.get("stop_hook_active") is not True and blocks < STOP_BLOCK_LIMIT
         message = "Handoff guard: " + "; ".join(issues)
         if retry:
             state["stop_blocks"] = blocks + 1
+            message += (" Make at most one bounded handoff correction, then finish this turn. "
+                        "If still unresolved, report the gap in your final response. "
+                        "Do not keep rewriting handoffs or debug/modify the guard just to pass this check.")
             print(json.dumps({"decision": "block", "reason": message}, ensure_ascii=False))
-        elif state.get("stop_warned") != key:
-            state["stop_warned"] = key
-            message += "; automatic retries stopped; handoff is still unresolved"
+        elif not state.get("stop_warned"):
+            state["stop_warned"] = True
+            message += "; automatic retries stopped; handoff is still unresolved; report the gap and finish this turn"
             print(json.dumps({"systemMessage": message}, ensure_ascii=False))
             # DSH 的 Stop 适配器不注入 systemMessage；stderr 会进入 hook/result 的诊断摘要。
             print(message, file=sys.stderr)

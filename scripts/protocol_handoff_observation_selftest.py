@@ -194,13 +194,28 @@ def run(source: Path) -> None:
             assert "systemMessage" in hook("recursive", "Stop", stop_active=True)
             print("  PASS recursive Stop warns rather than blocking again")
 
+            start("recursive-after-block"); material("recursive-after-block")
+            assert stop("recursive-after-block").get("decision") == "block"
+            assert "systemMessage" in hook("recursive-after-block", "Stop", stop_active=True)
+            assert stop("recursive-after-block") == {}
+            print("  PASS a recursive callback after the first block warns once, then stays quiet")
+
             start("budget"); material("budget")
+            assert stop("budget").get("decision") == "block"
             for attempt in range(3):
                 dashboard.write_text(dashboard.read_text()+f"\nUnrelated external change {attempt}\n")
-                assert stop("budget").get("decision") == "block"
-            dashboard.write_text(dashboard.read_text()+"\nAnother external change\n")
-            assert "systemMessage" in stop("budget")
-            print("  PASS even changing unresolved conditions cannot exceed three blocks")
+                (root / "papers/result.txt").write_text(f"still pending {attempt}")
+                material("budget")
+                result = stop("budget")
+                assert "systemMessage" in result if attempt == 0 else result == {}
+                assert "decision" not in result
+            print("  PASS real writes and PostToolUse cannot restart blocks or warnings while unresolved")
+
+            python_handoff("budget", "\nResolved budget\n")
+            assert stop("budget") == {}
+            material("budget")
+            assert stop("budget").get("decision") == "block"
+            print("  PASS only a clean Stop resets the budget for new work in the same session")
         finally:
             # 项目状态目录可能带根路径摘要；让待测版本自己计算，不依赖其实现。
             command = "import sys;sys.path.insert(0,'scripts');import protocol,protocol_guard as g; p=protocol.load(); print(g.temp_root(p.name,p.root))"
